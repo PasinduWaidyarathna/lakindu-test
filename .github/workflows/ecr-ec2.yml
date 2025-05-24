@@ -1,0 +1,120 @@
+name: CICD pipeline with ECR and EC2
+run-name: CICD pipeline with ECR and EC2
+
+on:
+  push:               # Trigger on pushes to main branch
+    branches:
+      - main
+    paths-ignore:     # Ignore changes to README.md/workflows
+      - 'README.md'
+      - '.github/workflows/**'
+  workflow_dispatch:  # Also allow manual trigger
+
+# Expose secrets & AWS/ECR settings as environment variables
+env:
+  SSH_USER: ${{secrets.SSH_USER}}                     # SSH user for EC2
+  SSH_HOST: ${{secrets.SSH_HOST}}                     # EC2 public host/IP
+  SSH_PRIVATE_KEY: ${{secrets.SSH_PRIVATE_KEY}}       # SSH private key
+  AWS_ACCESS_KEY_ID: ${{secrets.AWS_ACCESS_KEY_ID}}   # AWS credentials
+  AWS_SECRET_ACCESS_KEY: ${{secrets.AWS_SECRET_ACCESS_KEY}}
+  AWS_REGION: ${{secrets.AWS_REGION}}
+  ECR_REPOSITORY_URI: ${{ secrets.ECR_REPOSITORY_URI }}
+  ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+
+jobs:
+  ecr:
+    name: Build and Push Image to ECR
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout                    # 1. Get the latest code
+        uses: actions/checkout@v4
+      - name: Set up Docker Buildx        # 2. Enable BuildKit for multi‑platform builds
+        uses: docker/setup-buildx-action@v2
+      - name: Configure AWS Credentials   # 3. Grant Docker actions permission to push to ECR
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{env.AWS_ACCESS_KEY_ID}}
+          aws-secret-access-key: ${{env.AWS_SECRET_ACCESS_KEY}}
+          aws-region: ${{env.AWS_REGION}}
+      - name: Login to Amazon ECR         # 4. Authenticate Docker to ECR registry
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Build and push Docker image to ECR    # 5. Build image and push “latest” tag
+        uses: docker/build-push-action@v5
+        with:
+          context: .         # build context = repo root
+          push: true
+          tags: ${{ secrets.ECR_REPOSITORY_URI }}:latest
+  ec2:
+    needs: ecr          # Wait for ECR job to finish
+    name: Deploy Docker Container to EC2
+    runs-on: ubuntu-latest
+    steps:
+        # — Ensure Docker is present on the EC2 instance
+        - name: Install and Start Docker on EC2
+          uses: appleboy/ssh-action@v1.0.3
+          with:
+            host: ${{ secrets.SSH_HOST }}
+            username: ${{ secrets.SSH_USER }}
+            key: ${{ secrets.SSH_PRIVATE_KEY }}
+            script: |
+                if ! command -v docker &> /dev/null; then
+                    sudo apt-get update
+                    sudo apt-get install -y docker.io
+                    sudo systemctl start docker
+                    sudo systemctl enable docker
+                else
+                    echo "Docker is already installed."
+                fi
+
+        # — Ensure AWS CLI is available for ECR login
+        - name: Install AWS CLI on EC2
+          uses: appleboy/ssh-action@v1.0.3
+          with:
+            host: ${{ secrets.SSH_HOST }}
+            username: ${{ secrets.SSH_USER }}
+            key: ${{ secrets.SSH_PRIVATE_KEY }}
+            script: |
+                sudo apt-get update
+                sudo apt-get install -y snapd
+                if ! command -v aws &> /dev/null; then
+                    sudo snap install aws-cli --classic
+                else
+                    echo "AWS CLI is already installed."
+                fi
+                aws --version
+
+        # — Configure AWS credentials on EC2 so AWS CLI can authenticate
+        - name: Configure AWS Credentials on EC2
+          uses: appleboy/ssh-action@v1.0.3
+          with:
+            host: ${{ secrets.SSH_HOST }}
+            username: ${{ secrets.SSH_USER }}
+            key: ${{ secrets.SSH_PRIVATE_KEY }}
+            script: |
+                aws configure set aws_access_key_id ${{ secrets.AWS_ACCESS_KEY_ID }}
+                aws configure set aws_secret_access_key ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+                aws configure set region ${{ secrets.AWS_REGION }}
+
+        # — Log Docker into ECR from the EC2 host
+        - name: Login to Amazon ECR on EC2
+          uses: appleboy/ssh-action@v1.0.3
+          with:
+            host: ${{ secrets.SSH_HOST }}
+            username: ${{ secrets.SSH_USER }}
+            key: ${{ secrets.SSH_PRIVATE_KEY }}
+            script: |
+                aws ecr get-login-password --region ${{ secrets.AWS_REGION }} | sudo docker login --username AWS --password-stdin ${{ secrets.ECR_REGISTRY }}
+
+        # — Pull the new image, remove old container, and launch new one
+        - name: Pull and Run Docker Image on EC2
+          uses: appleboy/ssh-action@v1.0.3
+          with:
+            host: ${{ secrets.SSH_HOST }}
+            username: ${{ secrets.SSH_USER }}
+            key: ${{ secrets.SSH_PRIVATE_KEY }}
+            script: |
+                sudo docker stop docker-flask-ecr || true
+                sudo docker rm docker-flask-ecr || true
+                sudo docker rmi -f ${{ secrets.ECR_REPOSITORY_URI }} || true
+                sudo docker pull ${{ secrets.ECR_REPOSITORY_URI }}
+                sudo docker run --name docker-flask-ecr -d -p 5000:5000 ${{ secrets.ECR_REPOSITORY_URI }}
